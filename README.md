@@ -14,7 +14,7 @@ REST API сервис для загрузки и выгрузки данных �
 ./scripts/run.sh
 ```
 
-## API
+## API 
 
 ### POST /api/v0/prices
 
@@ -38,7 +38,7 @@ curl -F "file=@sample_data.zip" http://localhost:8080/api/v0/prices
 Выгрузка данных в zip-архив.
 
 ```bash
-curl http://localhost:8080/api/v0/prices -o data.zip
+curl http://localhost:8080/api/v0/prices -o data.zip 
 ```
 
 ## Тестирование
