@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"database/sql"
@@ -64,6 +65,44 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+serverPort, r))
 }
 
+func extractCSVFromZip(data []byte) ([]byte, error) {
+	zipReader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, f := range zipReader.File {
+		if strings.HasSuffix(strings.ToLower(f.Name), ".csv") {
+			rc, err := f.Open()
+			if err != nil {
+				return nil, err
+			}
+			defer rc.Close()
+			return io.ReadAll(rc)
+		}
+	}
+	return nil, fmt.Errorf("csv not found")
+}
+
+func extractCSVFromTar(data []byte) ([]byte, error) {
+	tarReader := tar.NewReader(bytes.NewReader(data))
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if strings.HasSuffix(strings.ToLower(header.Name), ".csv") {
+			return io.ReadAll(tarReader)
+		}
+	}
+	return nil, fmt.Errorf("csv not found")
+}
+
 func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 	file, _, err := r.FormFile("file")
 	if err != nil {
@@ -78,32 +117,24 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	zipReader, err := zip.NewReader(bytes.NewReader(fileBytes), int64(len(fileBytes)))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	archiveType := r.URL.Query().Get("type")
+	if archiveType == "" {
+		archiveType = "zip"
 	}
 
 	var csvContent []byte
-	for _, f := range zipReader.File {
-		if strings.HasSuffix(strings.ToLower(f.Name), ".csv") {
-			rc, err := f.Open()
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			csvContent, err = io.ReadAll(rc)
-			rc.Close()
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			break
-		}
+	switch archiveType {
+	case "zip":
+		csvContent, err = extractCSVFromZip(fileBytes)
+	case "tar":
+		csvContent, err = extractCSVFromTar(fileBytes)
+	default:
+		http.Error(w, "unsupported archive type", http.StatusBadRequest)
+		return
 	}
 
-	if csvContent == nil {
-		http.Error(w, "csv file not found", http.StatusBadRequest)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
