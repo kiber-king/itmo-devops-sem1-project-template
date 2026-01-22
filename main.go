@@ -26,6 +26,13 @@ type PostResponse struct {
 	TotalPrice      int `json:"total_price"`
 }
 
+type PriceRecord struct {
+	Name       string
+	Category   string
+	Price      float64
+	CreateDate string
+}
+
 var db *sql.DB
 
 func getEnv(key, defaultValue string) string {
@@ -48,12 +55,12 @@ func main() {
 	var err error
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	defer db.Close()
 
 	if err = db.Ping(); err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
 	r := mux.NewRouter()
@@ -62,7 +69,9 @@ func main() {
 
 	serverPort := getEnv("SERVER_PORT", "8080")
 	log.Printf("Server started on port %s", serverPort)
-	log.Fatal(http.ListenAndServe(":"+serverPort, r))
+	if err := http.ListenAndServe(":"+serverPort, r); err != nil {
+		panic(err)
+	}
 }
 
 func extractCSVFromZip(data []byte) ([]byte, error) {
@@ -77,8 +86,12 @@ func extractCSVFromZip(data []byte) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			defer rc.Close()
-			return io.ReadAll(rc)
+			content, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				return nil, err
+			}
+			return content, nil
 		}
 	}
 	return nil, fmt.Errorf("csv not found")
@@ -101,6 +114,49 @@ func extractCSVFromTar(data []byte) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("csv not found")
+}
+
+func parseAndValidateCSV(csvContent []byte) ([]PriceRecord, error) {
+	csvReader := csv.NewReader(bytes.NewReader(csvContent))
+	records, err := csvReader.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(records) < 2 {
+		return nil, fmt.Errorf("csv is empty")
+	}
+
+	var validRecords []PriceRecord
+
+	for _, record := range records[1:] {
+		if len(record) < 5 {
+			continue
+		}
+
+		name := strings.TrimSpace(record[1])
+		category := strings.TrimSpace(record[2])
+		priceStr := strings.TrimSpace(record[3])
+		dateStr := strings.TrimSpace(record[4])
+
+		if name == "" || category == "" || priceStr == "" || dateStr == "" {
+			continue
+		}
+
+		price, err := strconv.ParseFloat(priceStr, 64)
+		if err != nil {
+			continue
+		}
+
+		validRecords = append(validRecords, PriceRecord{
+			Name:       name,
+			Category:   category,
+			Price:      price,
+			CreateDate: dateStr,
+		})
+	}
+
+	return validRecords, nil
 }
 
 func handlePostPrices(w http.ResponseWriter, r *http.Request) {
@@ -138,60 +194,58 @@ func handlePostPrices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	csvReader := csv.NewReader(bytes.NewReader(csvContent))
-	records, err := csvReader.ReadAll()
+	validRecords, err := parseAndValidateCSV(csvContent)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	var totalItems int
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	insertedCount := 0
+	for _, rec := range validRecords {
+		_, err = tx.Exec(
+			`INSERT INTO prices (name, category, price, create_date) VALUES ($1, $2, $3, $4)`,
+			rec.Name, rec.Category, rec.Price, rec.CreateDate)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		insertedCount++
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var totalCategories int
 	var totalPrice float64
-	categories := make(map[string]bool)
-
-	for _, record := range records[1:] {
-		if len(record) < 5 {
-			continue
-		}
-
-		id, err := strconv.Atoi(record[0])
-		if err != nil {
-			continue
-		}
-
-		name := record[1]
-		category := record[2]
-
-		price, err := strconv.ParseFloat(record[3], 64)
-		if err != nil {
-			continue
-		}
-
-		createDate := record[4]
-
-		_, err = db.Exec(`INSERT INTO prices (id, create_date, name, category, price) VALUES ($1, $2, $3, $4, $5)`,
-			id, createDate, name, category, price)
-		if err != nil {
-			log.Println(err)
-		}
-
-		totalItems++
-		totalPrice += price
-		categories[category] = true
+	err = db.QueryRow(`SELECT COUNT(DISTINCT category), COALESCE(SUM(price), 0) FROM prices`).Scan(&totalCategories, &totalPrice)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	response := PostResponse{
-		TotalItems:      totalItems,
-		TotalCategories: len(categories),
+		TotalItems:      insertedCount,
+		TotalCategories: totalCategories,
 		TotalPrice:      int(totalPrice),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("error encoding response: %v", err)
+	}
 }
 
 func handleGetPrices(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query(`SELECT id, create_date, name, category, price FROM prices ORDER BY id`)
+	rows, err := db.Query(`SELECT id, name, category, price, create_date FROM prices ORDER BY id`)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -200,27 +254,45 @@ func handleGetPrices(w http.ResponseWriter, r *http.Request) {
 
 	var csvBuffer bytes.Buffer
 	csvWriter := csv.NewWriter(&csvBuffer)
-	csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
+
+	if err := csvWriter.Write([]string{"id", "name", "category", "price", "create_date"}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	for rows.Next() {
 		var id int
-		var createDate time.Time
 		var name, category string
 		var price float64
+		var createDate time.Time
 
-		if err := rows.Scan(&id, &createDate, &name, &category, &price); err != nil {
-			continue
+		if err := rows.Scan(&id, &name, &category, &price, &createDate); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
-		csvWriter.Write([]string{
+		if err := csvWriter.Write([]string{
 			strconv.Itoa(id),
 			name,
 			category,
 			fmt.Sprintf("%.2f", price),
 			createDate.Format("2006-01-02"),
-		})
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	csvWriter.Flush()
+	if err := csvWriter.Error(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	var zipBuffer bytes.Buffer
 	zipWriter := zip.NewWriter(&zipBuffer)
@@ -231,10 +303,19 @@ func handleGetPrices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileWriter.Write(csvBuffer.Bytes())
-	zipWriter.Close()
+	if _, err := fileWriter.Write(csvBuffer.Bytes()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
-	w.Write(zipBuffer.Bytes())
+	if _, err := w.Write(zipBuffer.Bytes()); err != nil {
+		log.Printf("error writing response: %v", err)
+	}
 }
